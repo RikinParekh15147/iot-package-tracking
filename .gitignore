@@ -1,0 +1,7 @@
+firmware/cargo_monitor/config.h
+backend/data/
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+build/
