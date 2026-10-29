@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 connection</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f8;color:#17262e;font:16px system-ui,sans-serif;padding:24px}main{width:100%;max-width:540px;background:white;border:1px solid #e1e6e9;border-radius:20px;padding:36px}small{color:#647680;letter-spacing:.1em}h1{font-size:28px;margin:12px 0}p{color:#647680;line-height:1.6}.indicator{margin:28px 0;padding:22px;border-radius:12px;background:#f1f4f6;display:flex;align-items:center;gap:12px;font-size:22px;font-weight:650}.dot{width:12px;height:12px;border-radius:50%;background:#88959c}.online{background:#e9f8ef;color:#167044}.online .dot{background:#20945c}label{display:block;font-size:14px;margin-top:16px}input,button{font:inherit;border-radius:8px;padding:11px 12px;width:100%;margin-top:7px}input{border:1px solid #ccd5da}button{background:#183d4a;color:white;border:0;cursor:pointer;margin-top:20px}a{color:#285c70}#detail{min-height:52px;font-size:14px}footer{border-top:1px solid #e6ebee;margin-top:24px;padding-top:18px;font-size:13px;color:#647680}
+</style>
+</head>
+<body><main>
+<small>PACKAGE TRACKING · FIRST CONNECTION</small>
+<h1>Your ESP32 connection</h1>
+<p>A simple live check between your board and this laptop.</p>
+<div class="indicator" id="indicator" role="status" aria-live="polite"><span class="dot"></span><span id="state">Waiting for ESP32</span></div>
+<p id="detail">Enter the device token to start checking.</p>
+<form id="settings"><label for="device">Device ID</label><input id="device" value="cargo-esp32-01" required maxlength="128"><label for="token">Device token</label><input id="token" type="password" placeholder="dev-token-change-me" autocomplete="off" required><button>Check connection</button></form>
+<footer>Checks every 2 seconds. The board sends a heartbeat every 5 seconds; after 20 seconds without one, it appears offline. <a href="/records">Sensor records</a></footer>
+</main><script>
+const form=document.querySelector('#settings'),state=document.querySelector('#state'),detail=document.querySelector('#detail'),indicator=document.querySelector('#indicator');
+let settings=null,busy=false;
+form.addEventListener('submit',event=>{event.preventDefault();settings={device:document.querySelector('#device').value.trim(),token:document.querySelector('#token').value};refresh()});
+async function refresh(){
+ if(!settings||busy)return;busy=true;
+ try{
+  const response=await fetch('/api/v1/connection?'+new URLSearchParams({device_id:settings.device}),{headers:{'X-Device-Token':settings.token},cache:'no-store',signal:AbortSignal.timeout(5000)});
+  if(!response.ok)throw Error(response.status===401?'Token rejected. Use the same token as the firmware.':'Server error: '+response.status);
+  const result=await response.json();indicator.classList.toggle('online',result.connected);
+  state.textContent=result.connected?'ESP32 is connected':result.last_seen?'ESP32 is offline':'Waiting for ESP32';
+  detail.textContent=result.last_seen?'Last heartbeat: '+new Date(result.last_seen).toLocaleTimeString()+' · '+Math.floor(result.age_seconds)+' seconds ago.':'Server is reachable. No heartbeat received from '+settings.device+' yet.';
+ }catch(error){indicator.classList.remove('online');state.textContent='Connection check failed';detail.textContent=error.message}
+ finally{busy=false}
+}
+setInterval(refresh,2000);
+</script></body></html>

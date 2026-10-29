@@ -7,10 +7,13 @@ import json
 import os
 import secrets
 import sqlite3
+import time
+from threading import Lock
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from backend.trips import init_trip_schema, install_trip_routes, save_heartbeat
 
 
 class Record(BaseModel):
@@ -19,6 +22,7 @@ class Record(BaseModel):
     uptime_ms: Annotated[int, Field(ge=0, le=2**63 - 1, strict=True)]
     kind: Annotated[str, Field(min_length=1, max_length=64)]
     data: dict[str, JsonValue]
+    trip_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None
 
 
 class Batch(BaseModel):
@@ -26,6 +30,15 @@ class Batch(BaseModel):
     device_id: Annotated[str, Field(min_length=1, max_length=128)]
     boot_id: Annotated[str, Field(min_length=1, max_length=128)]
     records: Annotated[list[Record], Field(min_length=1, max_length=100)]
+
+
+class Heartbeat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    device_id: Annotated[str, Field(min_length=1, max_length=128)]
+    firmware: Annotated[str | None, Field(max_length=80)] = None
+    ip: Annotated[str | None, Field(max_length=45)] = None
+    rssi: Annotated[int | None, Field(ge=-127, le=0)] = None
+    uptime_ms: Annotated[int | None, Field(ge=0)] = None
 
 
 def create_app(db_path: str | Path | None = None, token: str | None = None) -> FastAPI:
@@ -57,9 +70,12 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
                     UNIQUE(device_id, boot_id, seq)
                 )
             """)
+            init_trip_schema(connection)
         yield
 
     application = FastAPI(title="Cargo Integrity Test Server", lifespan=lifespan)
+    heartbeats = {}
+    heartbeat_lock = Lock()
 
     def authenticate(x_device_token: Annotated[str | None, Header()] = None):
         if x_device_token is None or not secrets.compare_digest(
@@ -71,6 +87,32 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
     def health():
         return {"status": "ok"}
 
+    @application.post("/api/v1/heartbeat", dependencies=[Depends(authenticate)])
+    def heartbeat(message: Heartbeat):
+        try:
+            with closing(connect()) as connection, connection:
+                trip_id = save_heartbeat(connection, message.model_dump())
+        except sqlite3.Error:
+            raise HTTPException(status_code=503, detail="Storage unavailable; retry heartbeat")
+        with heartbeat_lock:
+            heartbeats[message.device_id] = (time.monotonic(), datetime.now(timezone.utc).isoformat())
+        return {"accepted": True, "active_trip_id": trip_id}
+
+    @application.get("/api/v1/connection", dependencies=[Depends(authenticate)])
+    def connection_status(device_id: Annotated[str, Query(min_length=1, max_length=128)] = "cargo-esp32-01"):
+        with heartbeat_lock:
+            last = heartbeats.get(device_id)
+        age = max(0, time.monotonic() - last[0]) if last else None
+        return {"device_id": device_id, "connected": age is not None and age < 20,
+                "last_seen": last[1] if last else None, "age_seconds": age,
+                "timeout_seconds": 20}
+
+    @application.get("/records", include_in_schema=False)
+    def record_dashboard():
+        return FileResponse(Path(__file__).with_name("records.html"))
+
+    install_trip_routes(application, connect, authenticate, connection_status)
+
     @application.post("/api/v1/batches", dependencies=[Depends(authenticate)])
     def receive_batch(batch: Batch):
         received_at = datetime.now(timezone.utc).isoformat()
@@ -79,18 +121,23 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
             # sensor values must be sent as JSON null, never NaN/Infinity.
             rows = [
                 (batch.device_id, batch.boot_id, item.seq, item.uptime_ms,
-                 item.kind, json.dumps(item.data, allow_nan=False), received_at)
+                 item.kind, json.dumps(item.data, allow_nan=False), received_at, item.trip_id)
                 for item in batch.records
             ]
         except ValueError:
             raise HTTPException(status_code=422, detail="Sensor data must use finite JSON numbers or null")
         try:
             with closing(connect()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for trip_id in {item.trip_id for item in batch.records if item.trip_id}:
+                    trip = connection.execute("SELECT device_id FROM trips WHERE id = ?", (trip_id,)).fetchone()
+                    if trip is None or trip["device_id"] != batch.device_id:
+                        raise HTTPException(status_code=422, detail="Record trip must exist and belong to this device")
                 before = connection.total_changes
                 connection.executemany("""
                     INSERT INTO records
-                    (device_id, boot_id, seq, uptime_ms, kind, data, received_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (device_id, boot_id, seq, uptime_ms, kind, data, received_at, trip_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(device_id, boot_id, seq) DO NOTHING
                 """, rows)
                 inserted = connection.total_changes - before
@@ -121,6 +168,16 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
     @application.get("/", include_in_schema=False)
     def dashboard():
         return FileResponse(Path(__file__).with_name("dashboard.html"))
+
+    @application.get("/connection", include_in_schema=False)
+    def connection_page():
+        return FileResponse(Path(__file__).with_name("connection.html"))
+
+    @application.get("/assets/{name}", include_in_schema=False)
+    def asset(name: str):
+        if name not in {"dashboard.js", "dashboard.css"}:
+            raise HTTPException(status_code=404)
+        return FileResponse(Path(__file__).with_name(name))
 
     return application
 

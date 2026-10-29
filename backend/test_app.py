@@ -23,6 +23,25 @@ def batch(boot="boot-1"):
 AUTH = {"X-Device-Token": "test-secret"}
 
 
+def test_live_connection_requires_authenticated_heartbeat(server, monkeypatch):
+    client, _ = server
+    clock = [100.0]
+    monkeypatch.setattr("backend.app.time.monotonic", lambda: clock[0])
+    url = "/api/v1/connection?device_id=cargo-01"
+    assert client.get(url).status_code == 401
+    assert client.post("/api/v1/heartbeat", json={"device_id": "cargo-01"}).status_code == 401
+    assert client.get(url, headers=AUTH).json()["last_seen"] is None
+    client.post("/api/v1/batches", json=batch(), headers=AUTH)
+    assert client.get(url, headers=AUTH).json()["connected"] is False
+    assert client.post("/api/v1/heartbeat", json={"device_id": "cargo-01"}, headers=AUTH).json()["accepted"]
+    assert client.get(url, headers=AUTH).json()["connected"] is True
+    assert client.get("/api/v1/connection?device_id=another-board", headers=AUTH).json()["connected"] is False
+    clock[0] += 20
+    assert client.get(url, headers=AUTH).json()["connected"] is False
+    client.post("/api/v1/heartbeat", json={"device_id": "cargo-01"}, headers=AUTH)
+    assert client.get(url, headers=AUTH).json()["connected"] is True
+
+
 def test_authentication(server):
     client, _ = server
     assert client.get("/health").json() == {"status": "ok"}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cargo test monitor</title>
+<style>
+body{font:16px system-ui,sans-serif;margin:0;background:#10151d;color:#e7eef8}main{max-width:1200px;margin:auto;padding:28px}h1{margin-bottom:6px}p{color:#b3c0d2}form{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}input,button{font:inherit;padding:10px 12px;border:1px solid #42536c;border-radius:6px;background:#1b2636;color:inherit}button{cursor:pointer;background:#184d66}#status{padding:14px;background:#1b2636;border-radius:6px}.wrap{overflow:auto}table{border-collapse:collapse;width:100%;margin-top:18px}th,td{text-align:left;padding:12px;border-bottom:1px solid #303e52;vertical-align:top;font-size:14px}pre{margin:0;white-space:pre-wrap;min-width:230px;max-width:500px}small{color:#afbed0}.event{color:#ffcb76}
+</style>
+<main>
+<h1>Cargo test monitor</h1>
+<p>Readings and onboard detections received from your ESP32. Refreshes every two seconds.</p>
+<form id="settings"><input id="token" type="password" autocomplete="off" aria-label="Device token" placeholder="Device token (default: dev-token-change-me)"><input id="device" aria-label="Device filter" placeholder="Device ID (all if blank)"><button>Connect</button></form>
+<div id="status" role="status">Enter the same device token configured in the firmware and server.</div>
+<p><small>Receipt time is when the server received a record. Queued records may describe older events; device uptime is time since that boot, not a wall-clock timestamp. Recent receipt does not prove continuous connectivity.</small></p>
+<div class="wrap"><table><thead><tr><th>Received (your time)</th><th>Device / boot</th><th>Sequence / uptime</th><th>Kind</th><th>Data</th></tr></thead><tbody id="rows"></tbody></table></div>
+</main>
+<script>
+const token=document.querySelector('#token'), device=document.querySelector('#device'), statusBox=document.querySelector('#status'), rows=document.querySelector('#rows');
+let active=false,busy=false;
+document.querySelector('#settings').addEventListener('submit',e=>{e.preventDefault();active=true;refresh()});
+async function refresh(){
+ if(!active||busy)return;busy=true;
+ try{
+  const query=new URLSearchParams({limit:'100'});if(device.value.trim())query.set('device_id',device.value.trim());
+  const response=await fetch('/api/v1/records?'+query,{headers:{'X-Device-Token':token.value},cache:'no-store'});
+  if(!response.ok)throw new Error(response.status===401?'Token rejected. Enter the server DEVICE_TOKEN.':'Server returned '+response.status);
+  const result=await response.json();rows.replaceChildren();
+  for(const record of result.records){
+   const row=document.createElement('tr');
+   const values=[new Date(record.received_at).toLocaleString(),record.device_id+' / '+record.boot_id,record.seq+' / '+(record.uptime_ms/1000).toFixed(1)+'s',record.kind];
+   for(const value of values){const cell=document.createElement('td');cell.textContent=value;row.append(cell)}
+   if(record.kind!=='telemetry')row.children[3].className='event';
+   const cell=document.createElement('td'),pre=document.createElement('pre');pre.textContent=JSON.stringify(record.data,null,2);cell.append(pre);row.append(cell);rows.append(row);
+  }
+  statusBox.textContent=result.total+' stored records. Showing latest '+result.records.length+'. Checked '+new Date().toLocaleTimeString()+'.';
+ }catch(error){statusBox.textContent=error.message}finally{busy=false}
+}
+setInterval(refresh,2000);
+</script>
+</html>

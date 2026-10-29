@@ -21,6 +21,7 @@ uint32_t queueIds[CAPACITY], queueCount=0, nextFileId=1;
 uint32_t droppedRecords=0, storageErrors=0, sequenceNumber=0;
 bool fsReady=false;
 String bootId;
+String activeTripId; // Updated by heartbeat; copied into each queued record at capture time.
 uint8_t imuAddress=0x68;
 bool imuConfigured=false, imuValid=false, calibrated=false, armed=false;
 float ax=0,ay=0,az=0,gx=0,gy=0,gz=0,totalG=0,peakG=0,angleDeg=0;
@@ -64,6 +65,8 @@ void saveRecord(const char* kind, JsonObject data) {
   record["data"].set(data);
   const bool telemetry=strcmp(kind,"telemetry")==0;
   xSemaphoreTake(queueMutex,portMAX_DELAY);
+  if(activeTripId.length()) record["trip_id"]=activeTripId;
+  else record["trip_id"]=nullptr;
   if(!fsReady || queueCount>=(telemetry ? CAPACITY-EVENT_RESERVE : CAPACITY)) {
     ++droppedRecords; xSemaphoreGive(queueMutex); return;
   }
@@ -201,6 +204,10 @@ bool uploadBatch() {
 }
 void networkTask(void*) {
   uint32_t retryDelay=5000;
+  uint32_t lastHeartbeat=0;
+  bool heartbeatSent=false;
+  uint32_t lastUploadAttempt=0;
+  bool uploadAttempted=false;
   WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
   configTime(0,0,"pool.ntp.org","time.nist.gov");
@@ -209,12 +216,50 @@ void networkTask(void*) {
       Serial.println("Wi-Fi unavailable: continuing local monitoring and flash queue.");
       WiFi.reconnect();vTaskDelay(pdMS_TO_TICKS(10000));continue;
     }
+    if(!heartbeatSent || millis()-lastHeartbeat>=5000) {
+      lastHeartbeat=millis();heartbeatSent=true;
+      String heartbeatUrl=SERVER_URL;
+      const int suffix=heartbeatUrl.indexOf("/api/v1/batches");
+      if(suffix>=0) {
+        heartbeatUrl=heartbeatUrl.substring(0,suffix)+"/api/v1/heartbeat";
+        WiFiClient plain;WiFiClientSecure secure;HTTPClient http;
+        bool ready=false;
+        if(heartbeatUrl.startsWith("https://")) {
+          if(strlen(ROOT_CA_PEM)>0) { secure.setCACert(ROOT_CA_PEM);ready=http.begin(secure,heartbeatUrl); }
+        } else if(heartbeatUrl.startsWith("http://")) ready=http.begin(plain,heartbeatUrl);
+        if(ready) {
+          http.setConnectTimeout(1500);http.setTimeout(1500);
+          http.addHeader("Content-Type","application/json");http.addHeader("X-Device-Token",DEVICE_TOKEN);
+          JsonDocument message;message["device_id"]=DEVICE_ID;
+          message["firmware"]="cargo-monitor";message["ip"]=WiFi.localIP().toString();
+          message["rssi"]=WiFi.RSSI();message["uptime_ms"]=millis();
+          String payload;serializeJson(message,payload);
+          const int heartbeatCode=http.POST(payload);
+          if(heartbeatCode==200) {
+            JsonDocument response;
+            if(!deserializeJson(response,http.getString()) && response["accepted"]==true &&
+               (response["active_trip_id"].isNull() || response["active_trip_id"].is<const char*>())) {
+              xSemaphoreTake(queueMutex,portMAX_DELAY);
+              activeTripId=response["active_trip_id"].isNull() ? String("") : response["active_trip_id"].as<String>();
+              xSemaphoreGive(queueMutex);
+            }
+          }
+          Serial.printf("HEARTBEAT HTTP=%d\n",heartbeatCode);http.end();
+        }
+      }
+    }
     xSemaphoreTake(queueMutex,portMAX_DELAY);
     const bool pending=queueCount>0;
     xSemaphoreGive(queueMutex);
     if(!pending) { retryDelay=5000;vTaskDelay(pdMS_TO_TICKS(UPLOAD_MS));continue; }
+    if(uploadAttempted && millis()-lastUploadAttempt<retryDelay) { vTaskDelay(pdMS_TO_TICKS(250));continue; }
+    lastUploadAttempt=millis();uploadAttempted=true;
     if(uploadBatch()) { retryDelay=5000;vTaskDelay(pdMS_TO_TICKS(250)); }
-    else { vTaskDelay(pdMS_TO_TICKS(retryDelay));retryDelay=std::min(retryDelay*2,uint32_t(60000)); }
+    else {
+      // Poll the loop while backing off so heartbeats remain independent.
+      retryDelay=std::min(retryDelay*2,uint32_t(60000));
+      vTaskDelay(pdMS_TO_TICKS(250));
+    }
   }
 }
 void updateTimedRule(bool condition,uint32_t now,uint32_t duration,uint32_t& since,bool& active,

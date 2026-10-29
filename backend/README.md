@@ -1,7 +1,8 @@
 # Cargo rapid-test server
 
 An independent FastAPI + SQLite server. It does not run on the ESP32.
-The dashboard at `/` lists received readings and onboard events; `/docs` provides
+The page at `/` checks live ESP32 heartbeats; `/records` lists received readings
+and onboard events. See [first connection setup](../CONNECTION_SETUP.md). `/docs` provides
 interactive API documentation. No frontend build or database service is needed.
 
 ## Start on Windows (PowerShell, from project root)
