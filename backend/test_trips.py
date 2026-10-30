@@ -128,3 +128,58 @@ def test_alerts_and_latest_telemetry_are_scoped(server):
     assert detail['alert_count'] == detail['total'] == 1
     assert detail['activity'][0]['message'] == 'Lid opened'
     assert len(detail['telemetry']) == 1
+
+
+def test_cancelled_trip_history_and_delayed_records_stay_separate_from_next_trip(server):
+    client, _ = server
+    old = start(client).json()['id']
+    assert client.post(f'/api/v1/trips/{old}/logs', headers=AUTH,
+                       json={'kind': 'note', 'message': 'Original trip note'}).status_code == 201
+    assert client.post(f'/api/v1/trips/{old}/finish', headers=AUTH,
+                       json={'status': 'cancelled'}).status_code == 200
+    new = start(client, name='Next cargo').json()['id']
+    assert new != old
+    assert start(client).status_code == 409
+    # Different devices may have one active trip each.
+    assert start(client, device_id='cargo-02').status_code == 201
+    delayed = batch('delayed')
+    for record in delayed['records']:
+        record['trip_id'] = old
+    delayed['records'][1].update(kind='event', data={'type': 'packaging_separation', 'detail': 'Old package opened'})
+    assert client.post('/api/v1/batches', headers=AUTH, json=delayed).json()['inserted'] == 2
+    old_detail = client.get(f'/api/v1/trips/{old}', headers=AUTH).json()
+    new_detail = client.get(f'/api/v1/trips/{new}', headers=AUTH).json()
+    assert old_detail['trip']['status'] == 'cancelled'
+    assert old_detail['alert_count'] == 1
+    assert any(entry['message'] == 'Original trip note' for entry in old_detail['activity'])
+    assert new_detail['alert_count'] == 0 and new_detail['telemetry'] == []
+    assert all(entry.get('data', {}).get('type') != 'packaging_separation' for entry in new_detail['activity'])
+    assert client.post('/api/v1/heartbeat', headers=AUTH, json={'device_id': 'cargo-01'}).json()['active_trip_id'] == new
+    assert old_detail['trip']['id'] == old  # explicit history URL never resolves to active trip
+
+
+def test_handling_summary_counts_new_alert_types_and_reports_peak_without_duration(server):
+    client, _ = server
+    trip = start(client).json()['id']
+    records = []
+    for seq, (event_type, value) in enumerate([
+        ('impact', 3.4), ('impact', 5.2), ('impact', 4.1),
+        ('strong_vibration', 0.7), ('packaging_separation', 1),
+        ('likely_opened', 1), ('unsafe_environment', 30.0),
+    ], start=1):
+        records.append({'seq': seq, 'uptime_ms': seq * 1000, 'kind': 'event',
+                        'trip_id': trip, 'data': {'type': event_type, 'value': value}})
+    assert client.post('/api/v1/batches', headers=AUTH,
+                       json={'device_id': 'cargo-01', 'boot_id': 'handling', 'records': records}).status_code == 200
+    detail = client.get(f'/api/v1/trips/{trip}?kind=alert&limit=1', headers=AUTH).json()
+    assert detail['alert_count'] == 7
+    summary = detail['handling_summary']
+    assert summary['max_impact_g'] == 5.2
+    assert summary['max_impact_boot_id'] == 'handling'
+    assert summary['max_impact_uptime_ms'] == 2000
+    assert summary['max_impact_received_at'].endswith('+00:00')
+    assert summary['alert_event_counts'] == {
+        'impact': 3, 'strong_vibration': 1, 'packaging_separation': 1,
+        'likely_opened': 1, 'unsafe_environment': 1,
+    }
+    assert not any('duration' in key for key in summary)

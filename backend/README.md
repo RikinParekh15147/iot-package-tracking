@@ -5,6 +5,19 @@ The page at `/` checks live ESP32 heartbeats; `/records` lists received readings
 and onboard events. See [first connection setup](../CONNECTION_SETUP.md). `/docs` provides
 interactive API documentation. No frontend build or database service is needed.
 
+## Start independently of a chat terminal
+
+After installing the Windows virtual environment below, run from the project root:
+
+```powershell
+.\start_server.ps1
+```
+
+This starts the server as an independent background process. Closing the chat's
+terminal does not stop it. It reuses an already healthy server on the same port.
+Logs and the PID are under ignored `backend/data/`. A computer restart still
+requires starting the server again. For foreground debugging use the command below.
+
 ## Start on Windows (PowerShell, from project root)
 
 ```powershell
@@ -107,3 +120,13 @@ On Windows replace `backend/.venv/bin/python` with
 `backend/.venv/Scripts/python.exe`. Tests use temporary SQLite files and verify
 authentication, replay deduplication, batch validation, transactional rollback,
 and persistence after restart.
+
+## On-demand device snapshot
+
+POST `/api/v1/fetch` with `{"device_id":"cargo-esp32-01"}` and the normal token.
+A connected firmware advertising `supports_fetch: true` receives
+`telemetry_request_id` in heartbeat responses. Repeated requests coalesce until a
+matching committed telemetry record contains `data.fetch_request_id`. Failed
+writes and conflicting retry payloads do not clear it. Offline/unsupported devices
+return 409. GET `/api/v1/latest?device_id=...` returns latest telemetry and any
+pending request. Fetch commands are in memory and reset on server restart.

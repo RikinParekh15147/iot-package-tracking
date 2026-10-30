@@ -11,6 +11,7 @@ import uuid
 from fastapi import Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from backend.state_runs import build_state_sessions, build_state_timeline, decode_record
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]
 DeviceID = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
@@ -101,7 +102,8 @@ def save_heartbeat(db, message):
     return trip["id"] if trip else None
 
 
-ALERT_TYPES = {"suspected_tamper", "impact", "unsafe_tilt", "unexpected_light", "environment_warning", "imu_fault", "dht_fault", "network_task_failed"}
+ALERT_TYPES = {"suspected_tamper", "impact", "unsafe_tilt", "unexpected_light", "environment_warning", "imu_fault", "dht_fault", "network_task_failed",
+               "strong_vibration", "packaging_separation", "likely_opened", "unsafe_environment"}
 
 
 def record_entry(row):
@@ -119,6 +121,27 @@ def activity(db, trip_id):
             for r in db.execute("SELECT * FROM trip_logs WHERE trip_id=? ORDER BY id DESC", (trip_id,))]
     logs += [record_entry(r) for r in db.execute("SELECT * FROM records WHERE trip_id=? ORDER BY id DESC", (trip_id,))]
     return sorted(logs, key=lambda item: (item["created_at"], item["id"]), reverse=True)
+
+
+def handling_summary(entries):
+    # Counts describe recorded events, not a continuously measured exposure
+    # duration. Receipt times can be later than occurrence after offline travel.
+    counts = {}
+    maximum = None
+    maximum_entry = None
+    for entry in entries:
+        if entry["source"] != "device":
+            continue
+        event_type = str(entry["data"].get("type", ""))
+        if event_type in ALERT_TYPES:
+            counts[event_type] = counts.get(event_type, 0) + 1
+        value = entry["data"].get("value")
+        if event_type == "impact" and type(value) in {int, float} and value >= 0 and (maximum is None or value > maximum):
+            maximum, maximum_entry = value, entry
+    return {"alert_event_counts": counts, "max_impact_g": maximum,
+            "max_impact_received_at": maximum_entry["created_at"] if maximum_entry else None,
+            "max_impact_boot_id": maximum_entry["boot_id"] if maximum_entry else None,
+            "max_impact_uptime_ms": maximum_entry["uptime_ms"] if maximum_entry else None}
 
 
 def install_trip_routes(app, connect, authenticate, connection_status):
@@ -160,17 +183,39 @@ def install_trip_routes(app, connect, authenticate, connection_status):
     @app.get("/api/v1/trips/{trip_id}", dependencies=auth)
     def trip_detail(trip_id: str, offset: Annotated[int, Query(ge=0)] = 0,
                     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-                    kind: Literal["all", "alert", "checkpoint", "note", "device"] = "all"):
+                    kind: Literal["all", "alert", "checkpoint", "note", "device", "other"] = "all"):
         with closing(connect()) as db:
             trip = get_trip(db, trip_id)
             entries = activity(db, trip_id)
             telemetry = db.execute("SELECT * FROM records WHERE trip_id=? AND kind='telemetry' ORDER BY id DESC LIMIT 120", (trip_id,)).fetchall()
+            state_records = db.execute("SELECT * FROM records WHERE trip_id=? AND kind='telemetry'", (trip_id,)).fetchall()
             checkpoints = [e for e in entries if e["kind"] == "checkpoint"]
             alerts = sum(e["kind"] == "alert" for e in entries)
-            filtered = [e for e in entries if kind == "all" or e["kind"] == kind or (kind == "device" and (e["source"] == "device" or e["kind"] in {"heartbeat", "device_online"}))]
+            filtered = [e for e in entries if kind == "all" or e["kind"] == kind
+                        or (kind == "other" and e["kind"] != "telemetry")
+                        or (kind == "device" and (e["source"] == "device" or e["kind"] in {"heartbeat", "device_online"}))]
+            state_runs = build_state_sessions(state_records)
             return {"trip": trip, "activity": filtered[offset:offset+limit], "total": len(filtered),
                     "checkpoints": list(reversed(checkpoints)), "alert_count": alerts, "activity_count": len(entries),
+                    "handling_summary": handling_summary(entries),
+                    "state_runs": state_runs, "run_count": len(state_runs),
+                    "total_state_samples": sum(run["sample_count"] for run in state_runs),
+                    "timeline": build_state_timeline(state_records, entries, state_runs),
                     "telemetry": [{"received_at": r["received_at"], "data": json.loads(r["data"])} for r in reversed(telemetry)]}
+
+    @app.get("/api/v1/trips/{trip_id}/state-runs/{run_id}", dependencies=auth)
+    def state_run_records(trip_id: str, run_id: str, offset: Annotated[int, Query(ge=0)] = 0,
+                          limit: Annotated[int, Query(ge=1, le=200)] = 50):
+        with closing(connect()) as db:
+            get_trip(db, trip_id)
+            records = [decode_record(row) for row in db.execute(
+                "SELECT * FROM records WHERE trip_id=? AND kind='telemetry'", (trip_id,))]
+        run = next((run for run in build_state_sessions(records) if run["id"] == run_id), None)
+        if run is None:
+            raise HTTPException(status_code=404, detail="State run not found; refresh trip history after new uploads")
+        by_id = {record["id"]: record for record in records}
+        return {"trip_id": trip_id, "run": run, "total": run["sample_count"], "offset": offset,
+                "limit": limit, "records": [by_id[identifier] for identifier in run["record_ids"][offset:offset + limit]]}
 
     @app.post("/api/v1/trips/{trip_id}/logs", dependencies=auth, status_code=201)
     def create_log(trip_id: str, message: TripLog):

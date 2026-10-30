@@ -1,6 +1,9 @@
 #pragma once
 #define WIFI_SSID "YOUR_2_4_GHZ_WIFI"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+// Optional second default network; actual credentials belong in ignored config.h.
+#define WIFI_FALLBACK_SSID ""
+#define WIFI_FALLBACK_PASSWORD ""
 #define SERVER_URL "http://192.168.1.10:8000/api/v1/batches"
 #define DEVICE_TOKEN "dev-token-change-me"
 #define DEVICE_ID "cargo-esp32-01"

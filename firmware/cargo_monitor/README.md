@@ -13,7 +13,7 @@ The current local URL uses the laptop Wi-Fi address at setup time; update it if
 that address changes. Never use localhost on the ESP32. Wi-Fi credentials are
 compiled into the firmware; do not share compiled binaries containing them.
 
-Install ArduinoJson 7.x and DHT sensor library by Adafruit (with Adafruit Unified
+Install ArduinoJson 7.x, Adafruit MPU6050, and DHT sensor library by Adafruit (with Adafruit Unified
 Sensor dependency). Other libraries come with the ESP32 board package.
 Open cargo_monitor.ino and upload with the same board/port as component_test.
 Board used for compilation: esp32:esp32:esp32, default partition layout.
@@ -29,6 +29,7 @@ Serial commands (send one letter; newline setting does not matter):
 - `c`: capture stationary orientation reference and gyro bias; disarm first.
 - `a`: arm after lid is closed and a valid reference exists.
 - `d`: disarm. Every boot starts disarmed; this prototype does not persist arming.
+- `i`: print detected I2C addresses and MPU identity/configuration registers.
 
 For your bare LDR, light detection is disabled until a proper 10k divider is
 installed. Then enable LDR_ENABLED and tune LIGHT_THRESHOLD inside the closed
@@ -44,7 +45,8 @@ box and when opened. Light output here is raw ADC, not lux.
 - The local detector uses experimental rules, not trained ML or damage prediction.
   Neither opening nor an impact alone proves tampering or cargo damage.
 - DHT is read every 3 seconds. Environmental limits default to 10–35C and <=75%RH.
-- A telemetry summary is saved every 60 seconds, plus events as they occur.
+- A telemetry summary is saved every 5 seconds while the server is reachable,
+  every 60 seconds offline, and immediately on confirmed state changes.
 - Upload runs in a separate task. When connected, it sends up to 25 queued
   records per batch; backlog drains in successive batches. Normal check interval
   is 5 seconds; failed requests back off to 60 seconds. Offline reconnect checks
@@ -94,3 +96,56 @@ Lid and environment monitoring can continue while motion is unavailable.
 Cloud migration: deploy backend on persistent storage behind HTTPS, replace token,
 update SERVER_URL and ROOT_CA_PEM, and rebuild. No broker or separate database
 service is needed for this prototype.
+
+MPU startup uses Adafruit MPU6050 initialization, matching the original sensor
+test, and waits for samples after configuration. Near-zero acceleration alone is not considered a
+communication failure (it can occur in free fall); an entirely zero sensor frame
+is rejected. Low-g lasting over 500ms is treated as a fault for this cargo prototype. Tilt calculation is skipped near zero acceleration.
+
+The raw signed-byte decoder is named decodeSigned16: do not rename it to word,
+which is an Arduino macro and would replace calls with makeWord(index), yielding
+near-zero, incorrect acceleration. Actual sensor reads still check I2C byte counts.
+
+HTTP transport clients are declared before HTTPClient so they outlive its
+destructor. Connection reuse is disabled for this initial batch-upload prototype.
+
+## Fetch live data
+
+The dashboard's Fetch live data button requests a new snapshot through the next
+heartbeat (normally within 5 seconds). Firmware advertises supports_fetch and
+receives a request ID. The main sensor loop reads DHT again respecting its minimum
+interval, captures the latest motion/lid readings, and saves a telemetry record
+with fetch_request_id. The server clears the request only after matching telemetry
+is committed. Pending commands are coalesced per device and not recaptured on
+every heartbeat. Flash replay retains IDs; queued older records drain before the
+new record. Server restart clears pending commands; click Fetch again if needed.
+
+Fetching does not arm or disarm the cargo box. Disabled or failed sensors remain
+marked unavailable. The returned snapshot is stored in the original trip context;
+viewing live readings does not rewrite historical trip readings.
+
+## Raw application logs and event latency
+
+The sketch tees Serial application output into a bounded 96-line RAM buffer and
+uploads it to /api/v1/console. The dashboard links to /console for search, pause,
+trip filtering and download. USB boot-ROM/system-library logs are not captured by
+this wrapper. Overflow drops oldest pending debug lines and reports a counter;
+this does not replace persistent cargo events. Debug lines can be lost on reboot.
+
+Cargo events and classified state changes queue a full state snapshot and notify
+the network task immediately. The normal minute timer is not involved. Debounce,
+light hysteresis and sustained tilt/vibration rules still qualify transitions.
+When offline or the server fails, retry/backoff and persistent queue behavior apply.
+Online periodic snapshots are 5 seconds, offline 60 seconds; dashboard polling is
+2 seconds. The LDR is enabled in this local configuration following confirmation
+of a proper 10k divider. Exposure threshold remains experimental.
+
+### Default Wi-Fi recovery networks
+
+The ignored `config.h` supports `WIFI_SSID` / `WIFI_PASSWORD` and optional
+`WIFI_FALLBACK_SSID` / `WIFI_FALLBACK_PASSWORD`. Dashboard profiles are tried
+first; missing default networks are appended as recovery options, even when
+saved profiles exist. Duplicate SSIDs use the saved profile credentials. The
+current network is retained while the server remains reachable. Wi-Fi joining
+alone does not guarantee the configured server address is reachable from that
+network. Keep actual credentials in ignored `config.h`.

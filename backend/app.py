@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+import asyncio
 import json
 import os
 import secrets
@@ -10,10 +11,13 @@ import sqlite3
 import time
 from threading import Lock
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 from backend.trips import init_trip_schema, install_trip_routes, save_heartbeat
+from backend.wifi import heartbeat_wifi_config, init_wifi_schema, install_wifi_routes
+from backend.console import init_console_schema, install_console_routes
+from backend.analysis import init_analysis_schema, install_analysis_routes
 
 
 class Record(BaseModel):
@@ -38,7 +42,15 @@ class Heartbeat(BaseModel):
     firmware: Annotated[str | None, Field(max_length=80)] = None
     ip: Annotated[str | None, Field(max_length=45)] = None
     rssi: Annotated[int | None, Field(ge=-127, le=0)] = None
-    uptime_ms: Annotated[int | None, Field(ge=0)] = None
+    uptime_ms: Annotated[int, Field(ge=0, le=2**63 - 1, strict=True)] | None = None
+    supports_fetch: Annotated[bool, Field(strict=True)] = False
+    wifi_revision: Annotated[int, Field(ge=0, le=2**63 - 1, strict=True)] = 0
+    wifi_ssid: Annotated[str | None, Field(max_length=32, strict=True)] = None
+
+
+class FetchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    device_id: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=128)]
 
 
 def create_app(db_path: str | Path | None = None, token: str | None = None) -> FastAPI:
@@ -71,10 +83,25 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
                 )
             """)
             init_trip_schema(connection)
+            init_wifi_schema(connection)
+            init_console_schema(connection)
+            init_analysis_schema(connection)
         yield
 
     application = FastAPI(title="Cargo Integrity Test Server", lifespan=lifespan)
+
+    @application.exception_handler(sqlite3.Error)
+    async def storage_error(_request, _error):
+        # Trip routes share this fallback; transaction contexts have already
+        # rolled back before an error reaches the handler. Explicit 409 trip
+        # conflicts and route-specific storage responses remain unchanged.
+        return JSONResponse(status_code=503, content={"detail": "Storage unavailable; retry later"})
+
     heartbeats = {}
+    heartbeat_networks = {}
+    fetch_capabilities = {}
+    # Transient control requests survive device reconnects, not server restarts.
+    pending_fetches = {}
     heartbeat_lock = Lock()
 
     def authenticate(x_device_token: Annotated[str | None, Header()] = None):
@@ -82,6 +109,41 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
             x_device_token.encode(), expected_token.encode()
         ):
             raise HTTPException(status_code=401, detail="Invalid or missing X-Device-Token")
+
+    # One held request per dashboard; writes wake it after committing. This is
+    # deliberately process-local: run this prototype with one uvicorn worker.
+    change_condition = asyncio.Condition()
+    change_epoch = secrets.token_hex(8)
+    change_number = 0
+
+    @application.middleware("http")
+    async def announce_changes(request, call_next):
+        nonlocal change_number
+        response = await call_next(request)
+        if (request.url.path.startswith("/api/v1/")
+                and request.url.path != "/api/v1/console"
+                and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and 200 <= response.status_code < 300):
+            async with change_condition:
+                change_number += 1
+                change_condition.notify_all()
+        return response
+
+    @application.get("/api/v1/changes", dependencies=[Depends(authenticate)])
+    async def changes(request: Request, after: str = "", wait_ms: int = Query(default=2000, ge=0, le=20000)):
+        def revision():
+            return f"{change_epoch}:{change_number}"
+        deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+        async with change_condition:
+            while after == revision():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0 or await request.is_disconnected():
+                    break
+                try:
+                    await asyncio.wait_for(change_condition.wait(), min(remaining, .25))
+                except asyncio.TimeoutError:
+                    pass
+            return {"revision": revision(), "changed": after != revision()}
 
     @application.get("/health")
     def health():
@@ -92,26 +154,61 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
         try:
             with closing(connect()) as connection, connection:
                 trip_id = save_heartbeat(connection, message.model_dump())
+                wifi_config = heartbeat_wifi_config(connection, message.device_id, message.wifi_revision)
         except sqlite3.Error:
             raise HTTPException(status_code=503, detail="Storage unavailable; retry heartbeat")
         with heartbeat_lock:
             heartbeats[message.device_id] = (time.monotonic(), datetime.now(timezone.utc).isoformat())
-        return {"accepted": True, "active_trip_id": trip_id}
+            heartbeat_networks[message.device_id] = message.wifi_ssid
+            fetch_capabilities[message.device_id] = message.supports_fetch
+            telemetry_request_id = pending_fetches.get(message.device_id)
+        return {"accepted": True, "active_trip_id": trip_id,
+                "telemetry_request_id": telemetry_request_id, "wifi_config": wifi_config}
+
+    @application.post("/api/v1/fetch", dependencies=[Depends(authenticate)], status_code=202)
+    def request_telemetry(message: FetchRequest):
+        with heartbeat_lock:
+            last = heartbeats.get(message.device_id)
+            if last is None or time.monotonic() - last[0] >= 20:
+                raise HTTPException(status_code=409, detail="Device offline. Reconnect the ESP32 before fetching live data.")
+            if not fetch_capabilities.get(message.device_id, False):
+                raise HTTPException(status_code=409, detail="Device firmware does not support live fetch. Upload the updated firmware first.")
+            request_id = pending_fetches.setdefault(message.device_id, secrets.token_hex(16))
+        return {"request_id": request_id, "status": "pending", "device_id": message.device_id}
+
+    @application.get("/api/v1/latest", dependencies=[Depends(authenticate)])
+    def latest_telemetry(device_id: Annotated[str, Query(min_length=1, max_length=128)] = "cargo-esp32-01"):
+        with closing(connect()) as connection:
+            row = connection.execute("""SELECT * FROM records
+                WHERE device_id = ? AND kind = 'telemetry' ORDER BY id DESC LIMIT 1""", (device_id,)).fetchone()
+        with heartbeat_lock:
+            request_id = pending_fetches.get(device_id)
+        return {"device_id": device_id,
+                "record": {**dict(row), "data": json.loads(row["data"])} if row else None,
+                "request": {"request_id": request_id, "status": "pending"} if request_id else None}
 
     @application.get("/api/v1/connection", dependencies=[Depends(authenticate)])
     def connection_status(device_id: Annotated[str, Query(min_length=1, max_length=128)] = "cargo-esp32-01"):
         with heartbeat_lock:
             last = heartbeats.get(device_id)
+            ssid = heartbeat_networks.get(device_id)
         age = max(0, time.monotonic() - last[0]) if last else None
         return {"device_id": device_id, "connected": age is not None and age < 20,
                 "last_seen": last[1] if last else None, "age_seconds": age,
-                "timeout_seconds": 20}
+                "timeout_seconds": 20, "wifi_ssid": ssid}
 
     @application.get("/records", include_in_schema=False)
     def record_dashboard():
         return FileResponse(Path(__file__).with_name("records.html"))
 
     install_trip_routes(application, connect, authenticate, connection_status)
+    install_wifi_routes(application, connect, authenticate, connection_status)
+    install_console_routes(application, connect, authenticate)
+    install_analysis_routes(application, connect, authenticate, connection_status)
+
+    @application.get("/console", include_in_schema=False)
+    def console_page():
+        return FileResponse(Path(__file__).with_name("console.html"))
 
     @application.post("/api/v1/batches", dependencies=[Depends(authenticate)])
     def receive_batch(batch: Batch):
@@ -141,8 +238,24 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
                     ON CONFLICT(device_id, boot_id, seq) DO NOTHING
                 """, rows)
                 inserted = connection.total_changes - before
+                acknowledged_fetches = set()
+                for item in batch.records:
+                    request_id = item.data.get("fetch_request_id")
+                    if item.kind != "telemetry" or not isinstance(request_id, str):
+                        continue
+                    # A conflicting retry must not acknowledge a new request
+                    # using data that INSERT ... DO NOTHING did not store.
+                    stored = connection.execute("""SELECT kind, data FROM records
+                        WHERE device_id = ? AND boot_id = ? AND seq = ?""",
+                        (batch.device_id, batch.boot_id, item.seq)).fetchone()
+                    if stored["kind"] == "telemetry" and json.loads(stored["data"]).get("fetch_request_id") == request_id:
+                        acknowledged_fetches.add(request_id)
         except sqlite3.Error:
             raise HTTPException(status_code=503, detail="Storage unavailable; retry the complete batch")
+        # Only clear after the transaction context has successfully committed.
+        with heartbeat_lock:
+            if pending_fetches.get(batch.device_id) in acknowledged_fetches:
+                pending_fetches.pop(batch.device_id, None)
         # 'received' acknowledges the entire committed batch, including retry
         # duplicates. Duplicate IDs preserve the original stored record.
         return {"accepted": True, "received": len(batch.records), "inserted": inserted}

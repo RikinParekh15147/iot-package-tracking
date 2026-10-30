@@ -14,7 +14,7 @@ New firmware is firmware/cargo_monitor/cargo_monitor.ino.
    startup. First use: if storage cannot mount, send uppercase F to initialize it.
 5. With the magnet near the reed, send `a` to arm. Remove the magnet and look for
    suspected_tamper on Serial and the dashboard. Send `d` to disarm.
-6. Firmware reports once per minute plus events. Local detection keeps running
+6. Firmware reports every 5 seconds online, every minute offline, plus state changes. Local detection keeps running
    without Wi-Fi. Up to 256 records survive resets and replay after reconnection.
    Storage is bounded; counters report drops if it fills.
 

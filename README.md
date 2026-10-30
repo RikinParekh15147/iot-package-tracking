@@ -15,6 +15,8 @@ prevents retries from creating duplicate records.
 - [All-sensor Serial Monitor test and wiring](firmware/component_test/README.md)
 - [Connected firmware setup and limitations](firmware/cargo_monitor/README.md)
 - [FastAPI setup, API contract, and tests](backend/README.md)
+- [Complete test suite and live smoke check](TESTING.md)
+- [Fetch, Wi-Fi priority, trip rules, and condition states](FEATURES.md)
 
 Copy `firmware/cargo_monitor/config.example.h` to `config.h` and set your Wi-Fi,
 server URL, and token before compiling. The local config is excluded from Git.
@@ -48,3 +50,7 @@ overflow, sampling, offline timing, and sensor-fault behavior.
 
 Local development uses HTTP and a sample token. Cloud hosting requires HTTPS,
 certificate validation, a private token, and persistent database storage.
+
+## Guided analysis
+
+Open http://localhost:8000/analysis for guided physical trials, independent observations, preserved original logs and evidence export. Follow [ANALYSIS_START_HERE.md](ANALYSIS_START_HERE.md) for preparation and the first pilot; [QUANTITATIVE_ANALYSIS_PLAN.md](QUANTITATIVE_ANALYSIS_PLAN.md) defines the evaluation methodology. No real trial starts automatically.
