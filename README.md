@@ -17,6 +17,7 @@ prevents retries from creating duplicate records.
 - [FastAPI setup, API contract, and tests](backend/README.md)
 - [Complete test suite and live smoke check](TESTING.md)
 - [Fetch, Wi-Fi priority, trip rules, and condition states](FEATURES.md)
+- [Live ESP32 performance dashboard and delivery coverage](PERFORMANCE.md)
 
 Copy `firmware/cargo_monitor/config.example.h` to `config.h` and set your Wi-Fi,
 server URL, and token before compiling. The local config is excluded from Git.

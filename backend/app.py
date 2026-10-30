@@ -18,6 +18,7 @@ from backend.trips import init_trip_schema, install_trip_routes, save_heartbeat
 from backend.wifi import heartbeat_wifi_config, init_wifi_schema, install_wifi_routes
 from backend.console import init_console_schema, install_console_routes
 from backend.analysis import init_analysis_schema, install_analysis_routes
+from backend.performance import init_performance_schema, install_performance_routes
 
 
 class Record(BaseModel):
@@ -53,7 +54,7 @@ class FetchRequest(BaseModel):
     device_id: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=128)]
 
 
-def create_app(db_path: str | Path | None = None, token: str | None = None) -> FastAPI:
+def create_app(db_path: str | Path | None = None, token: str | None = None, performance_source: str | None = None) -> FastAPI:
     path = Path(db_path or os.environ.get("DB_PATH", str(Path(__file__).parent / "data" / "cargo.db")))
     expected_token = token if token is not None else os.environ.get("DEVICE_TOKEN", "dev-token-change-me")
     if not expected_token:
@@ -86,6 +87,7 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
             init_wifi_schema(connection)
             init_console_schema(connection)
             init_analysis_schema(connection)
+            init_performance_schema(connection)
         yield
 
     application = FastAPI(title="Cargo Integrity Test Server", lifespan=lifespan)
@@ -122,6 +124,7 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
         response = await call_next(request)
         if (request.url.path.startswith("/api/v1/")
                 and request.url.path != "/api/v1/console"
+                and not request.url.path.startswith("/api/v1/performance")
                 and request.method in {"POST", "PUT", "PATCH", "DELETE"}
                 and 200 <= response.status_code < 300):
             async with change_condition:
@@ -205,6 +208,8 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
     install_wifi_routes(application, connect, authenticate, connection_status)
     install_console_routes(application, connect, authenticate)
     install_analysis_routes(application, connect, authenticate, connection_status)
+    install_performance_routes(application, connect, authenticate, connection_status, expected_token,
+                               source_url=performance_source if performance_source is not None else "" if db_path is not None else None)
 
     @application.get("/console", include_in_schema=False)
     def console_page():
@@ -288,7 +293,7 @@ def create_app(db_path: str | Path | None = None, token: str | None = None) -> F
 
     @application.get("/assets/{name}", include_in_schema=False)
     def asset(name: str):
-        if name not in {"dashboard.js", "dashboard.css"}:
+        if name not in {"dashboard.js", "dashboard.css", "performance.js", "performance.css"}:
             raise HTTPException(status_code=404)
         return FileResponse(Path(__file__).with_name(name))
 
